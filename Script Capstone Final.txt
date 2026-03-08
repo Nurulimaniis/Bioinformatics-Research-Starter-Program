@@ -1,0 +1,208 @@
+# CAPSTONE TRANSCRIPTOMICS - GSE27262
+# Lung Adenocarcinoma (Tumor) vs Normal Lung Tissue
+# Platform: Affymetrix HG-U133 Plus 2.0 (GPL570)
+# Sampel: 50 (25 Tumor + 25 Normal)
+
+
+# PART A: Install and Load Package 
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("GEOquery")
+BiocManager::install("hgu133plus2.db", ask = FALSE)
+BiocManager::install(c("AnnotationDbi", "org.Hs.eg.db"))
+
+# Load library
+library(GEOquery)
+library(limma)
+library(hgu133plus2.db)   
+library(pheatmap)
+library(ggplot2)
+library(dplyr)
+library(AnnotationDbi) 
+library (umap)
+
+# PART B: Ambil data
+gset <- getGEO("GSE27262", GSEMatrix = TRUE, AnnotGPL = TRUE)[[1]]
+
+# PART C: Definisi kelompok 
+group_info <- pData(gset)$source_name_ch1   
+# Debug: tampilkan 10 sampel pertama untuk konfirmasi pola
+cat("=== 10 Sampel Pertama (untuk cek pola) ===\n")
+print(head(group_info, 10))
+
+# Buat group berdasarkan huruf TERAKHIR (N untuk normal dan T untuk Tumor)
+# Gunakan grepl dengan $ untuk pastikan di akhir string
+gset$group <- factor(ifelse(grepl("T$", group_info),
+                            "Tumor",
+                            ifelse(grepl("N$", group_info),
+                                   "Normal",
+                                   "Other")))
+
+# Cek hasil
+table(gset$group)  # Harus 25 Tumor & 25 Normal
+
+#Preprocessing
+ex <- exprs(gset)
+
+# Cek apakah perlu log2 transform
+qx <- as.numeric(quantile(ex, c(0, 0.25, 0.5, 0.75, 0.99, 1), na.rm = TRUE))
+LogTransform <- (qx[5] > 100) || (qx[6] - qx[1] > 50 && qx[2] > 0)
+
+if (LogTransform) {
+  ex[ex <= 0] <- NA
+  ex <- log2(ex)
+}
+
+# PART D: DESIGN MATRIX & ANALISIS LIMMA
+design <- model.matrix(~0 + gset$group)
+colnames(design) <- levels(gset$group)
+
+# Kontras: Tumor vs Normal
+contrast_formula <- "Tumor - Normal"
+contrast_matrix <- makeContrasts(contrasts = contrast_formula, levels = design)
+
+fit <- lmFit(ex, design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+# Ambil hasil DEG (adj.p < 0.01, sort by B statistic)
+topTableResults <- topTable(fit2, 
+                            adjust = "fdr", 
+                            sort.by = "B", 
+                            number = Inf, 
+                            p.value = 0.01)
+
+
+#PART E: ANOTASI NAMA GEN
+probe_ids <- rownames(topTableResults)
+
+gene_annotation <- AnnotationDbi::select(hgu133plus2.db,
+                                         keys = probe_ids,
+                                         columns = c("SYMBOL", "GENENAME"),
+                                         keytype = "PROBEID")
+# Hilangkan duplikat (ambil yang pertama saja per probe)
+gene_annotation <- gene_annotation[!duplicated(gene_annotation$PROBEID), ]
+
+topTableResults$PROBEID <- rownames(topTableResults)
+topTableResults <- merge(topTableResults, gene_annotation, 
+                         by = "PROBEID", all.x = TRUE)
+
+# Simpan hasil DEG
+dir.create("results", showWarnings = FALSE)
+write.csv(topTableResults, "results/DEG_GSE27262.csv", row.names = FALSE)
+
+# 2. Filter DEG yang signifikan secara biologis (threshold umum)
+# Kriteria: adj.P.Val < 0.05 & |log2FC| > 1
+deg_filtered <- topTableResults %>%
+  filter(adj.P.Val < 0.05 & abs(logFC) > 1) %>%
+  arrange(desc(abs(logFC)))
+# Simpan versi filtered 
+write.csv(deg_filtered, 
+          file = "results/DEG_GSE27262_Filtered_logFC1_padj005.csv", 
+          row.names = FALSE)
+message("DEG filtered (|logFC| > 1 & adj.P.Val < 0.05) disimpan di: results/DEG_GSE27262_Filtered_logFC1_padj005.csv")
+
+# Tampilkan ringkasan (Biologis signifikan)
+cat("\nJumlah DEG signifikan setelah filter:", nrow(deg_filtered), "\n")
+print(head(deg_filtered[, c("SYMBOL", "logFC", "adj.P.Val", "GENENAME")], 10))
+
+# Tampilkan top 10 DEG untuk cek cepat (tanpa filter logFC)
+cat("\n=== Top 10 DEG (Tumor vs Normal) ===\n")
+print(head(topTableResults[, c("SYMBOL", "logFC", "adj.P.Val", "GENENAME")], 10))
+
+#PART I: VISUALISASI
+# I.1 Boxplot
+group_colors <- ifelse(gset$group == "Tumor", "hotpink", "skyblue")
+boxplot(ex, col = group_colors, las = 2, outline = FALSE,
+        main = "Boxplot Distribusi Ekspresi per Sampel (GSE27262)",
+        ylab = "Expression Value (log2)")
+legend("topright", legend = levels(gset$group), fill = unique(group_colors))
+
+# I.2 Density Plot
+expr_long <- data.frame(
+  Expression = as.vector(ex),
+  Group = rep(gset$group, each = nrow(ex))
+)
+ggplot(expr_long, aes(x = Expression, color = Group)) +
+  geom_density(linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Distribusi Nilai Ekspresi Gen GSE27262")
+
+# I.3 UMAP
+umap_input <- t(ex)
+umap_result <- umap(umap_input)
+umap_df <- data.frame(
+  UMAP1 = umap_result$layout[,1],
+  UMAP2 = umap_result$layout[,2],
+  Group = gset$group
+)
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "UMAP Plot - Tumor vs Normal (GSE27262)")
+
+# I.4 Volcano Plot
+volcano_data <- data.frame(
+  logFC = topTableResults$logFC,
+  adj.P.Val = topTableResults$adj.P.Val,
+  Gene = topTableResults$SYMBOL
+)
+volcano_data$status <- "NO"
+volcano_data$status[volcano_data$logFC > 1 & volcano_data$adj.P.Val < 0.01] <- "UP"
+volcano_data$status[volcano_data$logFC < -1 & volcano_data$adj.P.Val < 0.01] <- "DOWN"
+
+ggplot(volcano_data, aes(x = logFC, y = -log10(adj.P.Val), color = status)) +
+  geom_point(alpha = 0.6) +
+  scale_color_manual(values = c("DOWN" = "blue", "NO" = "grey", "UP" = "red")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed") +
+  theme_minimal() +
+  ggtitle("Volcano Plot DEG Lung Adenocarcinoma (GSE27262)")
+
+# I.5 Heatmap Top 50
+topTableResults <- topTableResults[order(topTableResults$adj.P.Val), ]
+top50 <- head(topTableResults, 50)
+
+mat_heatmap <- ex[top50$PROBEID, ]
+gene_label <- ifelse(is.na(top50$SYMBOL) | top50$SYMBOL == "", 
+                     top50$PROBEID, top50$SYMBOL)
+rownames(mat_heatmap) <- gene_label
+
+mat_heatmap <- mat_heatmap[rowSums(is.na(mat_heatmap)) == 0, ]
+mat_heatmap <- mat_heatmap[apply(mat_heatmap, 1, var) > 0, ]
+
+annotation_col <- data.frame(Group = gset$group)
+rownames(annotation_col) <- colnames(mat_heatmap)
+
+pheatmap(mat_heatmap, 
+         scale = "row",
+         annotation_col = annotation_col,
+         show_colnames = FALSE,
+         show_rownames = TRUE,
+         fontsize_row = 7,
+         main = "Top 50 DEG - Tumor vs Normal (GSE27262)")
+# E. SIMPAN PLOT
+ggsave("results/Volcano_Plot.png", width = 8, height = 6)
+ggsave("results/UMAP_Plot.png", width = 8, height = 6)
+ggsave("results/Heatmap_Top50.png", width = 10, height = 8)
+
+
+# F. DAFTAR GEN UP-REGULATED UNTUK SHINYGO 
+
+down_genes <- topTableResults %>%
+  filter(logFC < -1 & adj.P.Val < 0.05) %>%
+  pull(SYMBOL)
+
+# Tampilkan
+cat("Jumlah gen DOWN-regulated:", length(down_genes), "\n\n")
+print(head(down_genes, 30))   # tampilkan 30 gen pertama
+
+# Simpan ke file txt 
+write.table(down_genes, 
+            "results/DOWN_regulated_genes.txt", 
+            row.names = FALSE, 
+            col.names = FALSE, 
+            quote = FALSE)
+
+
+# Selanjutnya analisis enrichment dan visualisasi dilakukan menggunakan ShinyGO
